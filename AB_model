@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Exciton model for molecular crystals from CIF
+Includes:
+- CIF reader
+- Supercell construction
+- Molecule clustering
+- Two-layer (A/B) site-energy model
+- Dipole–dipole exciton Hamiltonian
+- Exciton energies & brightness
+- Theoretical luminescence spectrum
+"""
+
+import argparse
+import math
+import numpy as np
+import matplotlib as mpl
+
+mpl.rcParams.update({
+    "pdf.fonttype": 42,        # TrueType (редактируемый текст)
+    "ps.fonttype": 42,
+    "font.size": 8,            # Optica обычно 8–9 pt
+    "axes.labelsize": 8,
+    "axes.titlesize": 9,
+    "xtick.labelsize": 7,
+    "ytick.labelsize": 7,
+    "legend.fontsize": 7,
+    "lines.linewidth": 1.2,
+})
+
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+# =========================
+# Physical constants
+# =========================
+DEBYE_TO_C_M = 3.33564e-30
+ANGSTROM_TO_M = 1e-10
+EPS0 = 8.8541878128e-12
+E_CHARGE = 1.602176634e-19
+HC_EV_NM = 1239.841984  # eV·nm
+kB_eV = 8.617333262e-5
+
+# =========================
+# Data classes
+# =========================
+@dataclass
+class Atom:
+    label: str
+    element: str
+    frac: np.ndarray
+
+@dataclass
+class Crystal:
+    a: float
+    b: float
+    c: float
+    alpha: float
+    beta: float
+    gamma: float
+    atoms: List[Atom]
+
+    @property
+    def lattice_vectors(self) -> np.ndarray:
+        a, b, c = self.a, self.b, self.c
+        alpha = math.radians(self.alpha)
+        beta = math.radians(self.beta)
+        gamma = math.radians(self.gamma)
+
+        a_vec = np.array([a, 0, 0])
+        b_vec = np.array([b * math.cos(gamma), b * math.sin(gamma), 0])
+
+        cx = c * math.cos(beta)
+        cy = c * (math.cos(alpha) - math.cos(beta) * math.cos(gamma)) / math.sin(gamma)
+        cz = math.sqrt(max(c**2 - cx**2 - cy**2, 0))
+        c_vec = np.array([cx, cy, cz])
+
+        return np.vstack([a_vec, b_vec, c_vec])
+
+# =========================
+# CIF reader (minimal)
+# =========================
+def clean_number(x: str) -> float:
+    if "(" in x:
+        x = x.split("(")[0]
+    return float(x)
+
+def read_cif(path: str) -> Crystal:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+    cell = {}
+    atoms = []
+
+    for l in lines:
+        if l.lower().startswith("_cell_length_a"):
+            cell["a"] = clean_number(l.split()[-1])
+        elif l.lower().startswith("_cell_length_b"):
+            cell["b"] = clean_number(l.split()[-1])
+        elif l.lower().startswith("_cell_length_c"):
+            cell["c"] = clean_number(l.split()[-1])
+        elif l.lower().startswith("_cell_angle_alpha"):
+            cell["alpha"] = clean_number(l.split()[-1])
+        elif l.lower().startswith("_cell_angle_beta"):
+            cell["beta"] = clean_number(l.split()[-1])
+        elif l.lower().startswith("_cell_angle_gamma"):
+            cell["gamma"] = clean_number(l.split()[-1])
+
+    for i, l in enumerate(lines):
+        if l.lower() == "loop_":
+            headers = []
+            j = i + 1
+            while lines[j].startswith("_"):
+                headers.append(lines[j])
+                j += 1
+            if any("_atom_site_fract_x" in h for h in headers):
+                idx = {h: headers.index(h) for h in headers}
+                while j < len(lines) and not lines[j].startswith("_") and not lines[j].lower().startswith("loop_"):
+                    row = lines[j].split()
+                    fx = clean_number(row[idx["_atom_site_fract_x"]])
+                    fy = clean_number(row[idx["_atom_site_fract_y"]])
+                    fz = clean_number(row[idx["_atom_site_fract_z"]])
+                    fx, fy, fz = fx % 1, fy % 1, fz % 1
+                    label = row[idx.get("_atom_site_label", 0)]
+                    elem = row[idx.get("_atom_site_type_symbol", 0)]
+                    atoms.append(Atom(label, elem, np.array([fx, fy, fz])))
+                    j += 1
+
+    return Crystal(
+        cell["a"], cell["b"], cell["c"],
+        cell["alpha"], cell["beta"], cell["gamma"],
+        atoms
+    )
+
+# =========================
+# Supercell
+# =========================
+def build_supercell(crys: Crystal, nx, ny, nz):
+    lat = crys.lattice_vectors
+    coords = []
+    elements = []
+
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                shift = np.array([ix, iy, iz])
+                for a in crys.atoms:
+                    r = (a.frac + shift) @ lat
+                    coords.append(r)
+                    elements.append(a.element)
+
+    return np.array(coords), elements
+
+# =========================
+# Molecule clustering
+# =========================
+COV_RAD = {"H": 0.31, "C": 0.76, "N": 0.71, "O": 0.66, "S": 1.05}
+
+def bond_graph(coords, elements, tol=0.45):
+    n = len(coords)
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        ri = COV_RAD.get(elements[i], 0.8)
+        for j in range(i + 1, n):
+            rj = COV_RAD.get(elements[j], 0.8)
+            if np.linalg.norm(coords[i] - coords[j]) < ri + rj + tol:
+                adj[i].append(j)
+                adj[j].append(i)
+    return adj
+
+def connected_components(adj):
+    seen = set()
+    comps = []
+    for i in range(len(adj)):
+        if i in seen:
+            continue
+        stack = [i]
+        comp = []
+        seen.add(i)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        comps.append(comp)
+    return comps
+
+# =========================
+# Chromophores (A/B model)
+# =========================
+@dataclass
+class Chromophore:
+    center: np.ndarray
+    mu: np.ndarray
+    site_e: float
+
+def build_chromophores(coords, elements, comps, site_e, mu_D, delta_site):
+    centers = []
+    valid = []
+
+    for c in comps:
+        elems = [elements[i] for i in c]
+        if len(c) > 25 and "N" in elems:
+            center = coords[c].mean(axis=0)
+            centers.append(center)
+            valid.append(c)
+
+    z_vals = np.array([c[2] for c in centers])
+    z_med = np.median(z_vals)
+
+    chroms = []
+    for center in centers:
+        if center[2] >= z_med:
+            e = site_e
+        else:
+            e = site_e - delta_site
+        mu = np.array([mu_D, 0, 0])
+        chroms.append(Chromophore(center, mu, e))
+
+    return chroms
+
+# =========================
+# Exciton Hamiltonian
+# =========================
+def J_dipole(mu_i, mu_j, R, eps_r):
+    Rm = R * ANGSTROM_TO_M
+    Rn = np.linalg.norm(Rm)
+    if Rn < 1e-12:
+        return 0.0
+    mui = mu_i * DEBYE_TO_C_M
+    muj = mu_j * DEBYE_TO_C_M
+    dot = np.dot(mui, muj)
+    muiR = np.dot(mui, Rm)
+    mujR = np.dot(muj, Rm)
+    J = (dot / Rn**3 - 3 * muiR * mujR / Rn**5)
+    J *= 1 / (4 * math.pi * EPS0 * eps_r)
+    return J / E_CHARGE
+
+def build_H(chroms, eps_r, r_cut=30):
+    n = len(chroms)
+    H = np.zeros((n, n))
+    for i in range(n):
+        H[i, i] = chroms[i].site_e
+        for j in range(i + 1, n):
+            R = chroms[j].center - chroms[i].center
+            if np.linalg.norm(R) < r_cut:
+                J = J_dipole(chroms[i].mu, chroms[j].mu, R, eps_r)
+                H[i, j] = H[j, i] = J
+    return H
+
+def brightness(chroms, eigvecs):
+    mus = np.array([c.mu for c in chroms])
+    bright = []
+    for a in range(len(eigvecs)):
+        mu_a = np.sum(eigvecs[:, a][:, None] * mus, axis=0)
+        bright.append(np.dot(mu_a, mu_a))
+    bright = np.array(bright)
+    return bright / bright.max()
+
+# =========================
+# Luminescence spectrum
+# =========================
+def emission(E, B, reorg, sigma, T):
+    Emin = E.min()
+    pop = np.exp(-(E - Emin) / (kB_eV * T))
+    w = B * pop
+    w /= w.sum()
+
+    E_grid = np.linspace(E.min() - 0.3, E.max(), 2000)
+    I = np.zeros_like(E_grid)
+    for e, wi in zip(E, w):
+        I += wi * np.exp(-0.5 * ((E_grid - (e - reorg)) / sigma) ** 2)
+
+    I /= I.max()
+    wl = HC_EV_NM / E_grid
+    return wl, I
+
+
+def plot_chromophores(positions, layers=None, title="DAST chromophores"):
+    """
+    positions : (N,3) array
+    layers    : None or array of 0/1 (A/B)
+    """
+    fig = plt.figure(figsize=(7,6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    if layers is None:
+        ax.scatter(positions[:,0], positions[:,1], positions[:,2],
+                   s=40, c='k')
+    else:
+        for lab, col, name in [(0,'tab:blue','Layer A'),
+                               (1,'tab:red','Layer B')]:
+            mask = layers == lab
+            ax.scatter(positions[mask,0],
+                       positions[mask,1],
+                       positions[mask,2],
+                       s=50, c=col, label=name)
+
+        ax.legend()
+
+    ax.set_xlabel("x (Å)")
+    ax.set_ylabel("y (Å)")
+    ax.set_zlabel("z (Å)")
+    ax.set_title(title)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_exciton_network(positions, J, J_min=0.005):
+    """
+    positions : (N,3)
+    J         : NxN coupling matrix (eV)
+    """
+    fig = plt.figure(figsize=(7,6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # points
+    ax.scatter(positions[:,0], positions[:,1], positions[:,2],
+               c='k', s=30)
+
+    # couplings
+    N = len(positions)
+    for i in range(N):
+        for j in range(i+1, N):
+            Jij = J[i,j]
+            if abs(Jij) > J_min:
+                col = 'red' if Jij < 0 else 'blue'
+                lw  = 2.5 * abs(Jij) / np.max(np.abs(J))
+                ax.plot([positions[i,0], positions[j,0]],
+                        [positions[i,1], positions[j,1]],
+                        [positions[i,2], positions[j,2]],
+                        color=col, linewidth=lw, alpha=0.7)
+
+    ax.set_title("Excitonic coupling network")
+    plt.tight_layout()
+    plt.show()
+
+def plot_exciton_state(positions, eigvec, title="Lowest exciton state"):
+    """
+    eigvec : eigenvector of exciton Hamiltonian
+    """
+    weight = np.abs(eigvec)**2
+    weight /= weight.max()
+
+    fig = plt.figure(figsize=(7,6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    sc = ax.scatter(positions[:,0], positions[:,1], positions[:,2],
+                    s=800*weight + 20,
+                    c=weight, cmap='inferno')
+
+    plt.colorbar(sc, label=r"$|c_i|^2$")
+    ax.set_title(title)
+
+    plt.tight_layout()
+    plt.show()
+
+def chromophore_positions_and_layers(chroms):
+    """
+    Extract positions and A/B layers from chromophores
+    """
+    positions = np.array([c.center for c in chroms])
+
+    z = positions[:, 2]
+    z_med = np.median(z)
+
+    # Layer assignment: A = 0, B = 1
+    layers = np.zeros(len(z), dtype=int)
+    layers[z < z_med] = 1
+
+    return positions, layers
+
+
+def extract_J_matrix(H):
+    """
+    Extract coupling matrix J from exciton Hamiltonian H
+    (diagonal removed)
+    """
+    J = H.copy()
+    np.fill_diagonal(J, 0.0)
+    return J
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cif", required=True)
+    ap.add_argument("--supercell", nargs=3, type=int, default=[3, 3, 2])
+    ap.add_argument("--eps_r", type=float, default=3.0)
+    ap.add_argument("--site_e", type=float, default=2.0)
+    ap.add_argument("--mu_D", type=float, default=10.0)
+    ap.add_argument("--delta_site", type=float, default=0.0)
+    ap.add_argument("--reorg", type=float, default=0.10)
+    ap.add_argument("--sigma", type=float, default=0.06)
+    ap.add_argument("--T", type=float, default=300)
+    args = ap.parse_args()
+
+    crys = read_cif(args.cif)
+    coords, elements = build_supercell(crys, *args.supercell)
+    comps = connected_components(bond_graph(coords, elements))
+    chroms = build_chromophores(coords, elements, comps, args.site_e, args.mu_D, args.delta_site)
+
+    print(f"Detected chromophores: {len(chroms)}")
+
+    H = build_H(chroms, args.eps_r)
+    E, V = np.linalg.eigh(H)
+    B = brightness(chroms, V)
+
+    wl, I = emission(E, B, args.reorg, args.sigma, args.T)
+
+    print(f"Lowest exciton energy: {E[0]:.4f} eV -> {HC_EV_NM/E[0]:.1f} nm")
+    print(f"Predicted emission peak (model): ~{wl[np.argmax(I)]:.1f} nm")
+
+    plt.figure(figsize=(3.4, 2.5))  # ~1-column Optica
+    plt.stem(E[:40])
+    plt.xlabel("Exciton state index")
+    plt.ylabel("Energy (eV)")
+    plt.title("Exciton energy levels")
+    plt.tight_layout()
+    plt.savefig("fig_exciton_levels.pdf", format="pdf")
+    plt.close()
+
+
+    plt.figure(figsize=(3.4, 2.5))
+    plt.plot(wl, I)
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Normalized intensity")
+    plt.title("Theoretical luminescence (Form III)")
+    plt.gca().invert_xaxis()  # стандарт в спектроскопии
+    plt.tight_layout()
+    plt.savefig("fig_luminescence_FormIII.pdf", format="pdf")
+    plt.close()
+
+    # =========================
+    # VISUALIZATION
+    # =========================
+
+    positions, layers = chromophore_positions_and_layers(chroms)
+    J = extract_J_matrix(H)
+
+    plot_chromophores(
+        positions,
+        layers,
+        title="DAST chromophores (A/B layers)"
+    )
+
+    plot_exciton_network(
+        positions,
+        J,
+        J_min=0.005
+    )
+
+    plot_exciton_state(
+        positions,
+        V[:, 0],
+        title="Lowest-energy exciton (Form III)"
+    )
+
+
+if __name__ == "__main__":
+    main()
